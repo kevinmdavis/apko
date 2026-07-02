@@ -418,6 +418,12 @@ func (d *defaultPackageGetter) cachePackage(ctx context.Context, pkg Installable
 
 	exp.TarFile = tarDst
 
+	// The Section fields still reference the pre-advertise temp paths;
+	// clear them so accessors fall back to the updated path fields.
+	exp.Control = nil
+	exp.Signature = nil
+	exp.Package = nil
+
 	// Re-initialize the tarfs with the renamed file.
 	// TODO: Split out the tarfs Index creation from the FS.
 	// TODO: Consolidate ExpandAPK(), cachedPackage(), and cachePackage().

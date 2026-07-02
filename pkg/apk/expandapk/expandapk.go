@@ -85,6 +85,27 @@ type APKExpanded struct {
 	// Exposes TarFile as an indexed FS implementation.
 	TarFS *tarfs.FS
 
+	// Signature provides access to the compressed signature stream. When
+	// nil (e.g. for unsigned packages, or structs constructed with only the
+	// path fields), SignatureFile is used instead.
+	Signature Section
+
+	// Control provides access to the compressed control stream. When nil,
+	// ControlFile is used instead.
+	Control Section
+
+	// Package provides access to the compressed package data stream. When
+	// nil, PackageFile is used instead.
+	Package Section
+
+	// Validate, when non-nil, is used by IsValid in place of checking that
+	// the path fields still refer to the expected files on disk.
+	Validate func() bool
+
+	// Cleanup, when non-nil, is used by Close in place of removing the
+	// temporary directory backing the path fields.
+	Cleanup func() error
+
 	ControlHash   []byte
 	PackageHash   []byte
 	SignatureHash []byte
@@ -128,7 +149,13 @@ func (a *APKExpanded) ControlData() ([]byte, error) {
 	a.Lock()
 	defer a.Unlock()
 	if a.controlData == nil {
-		rc, err := os.Open(a.ControlFile)
+		var rc io.ReadCloser
+		var err error
+		if a.Control != nil {
+			rc, err = a.Control.Open()
+		} else {
+			rc, err = os.Open(a.ControlFile)
+		}
 		if err != nil {
 			return nil, err
 		}
@@ -153,6 +180,10 @@ func (a *APKExpanded) ControlData() ([]byte, error) {
 	return a.controlData, nil
 }
 
+// PackageData returns the uncompressed package data as a file, decompressing
+// PackageFile to TarFile first if needed. It requires the file-backed path
+// fields (TarFile/PackageFile) to be set; instances not backed by files do
+// not use it and construct TarFS directly instead.
 func (a *APKExpanded) PackageData() (*os.File, error) {
 	uf, err := os.Open(a.TarFile)
 	if err == nil {
@@ -196,6 +227,28 @@ func (a *APKExpanded) APK() (io.ReadCloser, error) {
 	rs := []io.Reader{}
 	cs := []io.Closer{}
 
+	if a.Signature != nil || a.Control != nil || a.Package != nil {
+		for _, s := range []Section{a.Signature, a.Control, a.Package} {
+			if s == nil {
+				continue
+			}
+			rc, err := s.Open()
+			if err != nil {
+				for _, c := range cs {
+					c.Close()
+				}
+				return nil, err
+			}
+			rs = append(rs, rc)
+			cs = append(cs, rc)
+		}
+
+		return &multiReadCloser{
+			r:       io.MultiReader(rs...),
+			closers: cs,
+		}, nil
+	}
+
 	for _, fn := range []string{a.SignatureFile, a.ControlFile, a.PackageFile} {
 		if fn != "" {
 			f, err := os.Open(fn)
@@ -234,7 +287,13 @@ func (m *multiReadCloser) Close() error {
 // the underlying files exist and that the file handles match the expected files.
 // Since this structure is heavily cached, this is useful to verify that the
 // cached data is still valid.
+//
+// If Validate is non-nil, it is used instead of the file-based checks.
 func (a *APKExpanded) IsValid() bool {
+	if a.Validate != nil {
+		return a.Validate()
+	}
+
 	if f, ok := a.TarFS.UnderlyingReader().(*os.File); ok {
 		// Verify that the file descriptor matches the expected file on disk.
 		fdInfo, err := f.Stat()
@@ -266,7 +325,13 @@ func (a *APKExpanded) IsValid() bool {
 	return true
 }
 
+// Close releases the resources backing the expanded APK. If Cleanup is
+// non-nil it is used instead of removing the temporary directory.
 func (a *APKExpanded) Close() error {
+	if a.Cleanup != nil {
+		return a.Cleanup()
+	}
+
 	errs := []error{}
 
 	if a.tempDir != "" {
@@ -568,10 +633,12 @@ func ExpandApkWithOptions(ctx context.Context, source io.Reader, cacheDir string
 		ControlFile: gzipStreams[controlDataIndex],
 		ControlHash: hashes[controlDataIndex],
 		ControlSize: sizes[controlDataIndex],
+		Control:     &fileSection{path: gzipStreams[controlDataIndex], size: sizes[controlDataIndex]},
 
 		PackageFile: gzipStreams[packageIndex],
 		PackageHash: hashes[packageIndex],
 		PackageSize: sizes[packageIndex],
+		Package:     &fileSection{path: gzipStreams[packageIndex], size: sizes[packageIndex]},
 
 		opts: options,
 	}
@@ -579,6 +646,7 @@ func ExpandApkWithOptions(ctx context.Context, source io.Reader, cacheDir string
 		expanded.SignatureFile = gzipStreams[signatureIndex]
 		expanded.SignatureHash = hashes[signatureIndex]
 		expanded.SignatureSize = sizes[signatureIndex]
+		expanded.Signature = &fileSection{path: gzipStreams[signatureIndex], size: sizes[signatureIndex]}
 	}
 
 	control, err := expanded.ControlData()
