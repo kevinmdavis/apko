@@ -35,20 +35,36 @@ import (
 )
 
 func (bc *Context) buildLayers(ctx context.Context) ([]v1.Layer, error) {
+	groups, pkgToDiff, err := bc.layerGroups(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	// Then partition that single fs.FS into multiple layers based on our layering strategy.
+	if bc.ic.Format.Resolved() == types.LayerFormatErofs {
+		return splitErofsLayers(ctx, bc.fs, groups, pkgToDiff, bc.o.TempDir(), bc.o.SourceDateEpoch)
+	}
+	return splitLayers(ctx, bc.fs, groups, pkgToDiff, bc.o.TempDir(), bc.o.CompressedLayerFile)
+}
+
+// layerGroups builds the image filesystem for a multi-layer build and
+// partitions its packages into the layering strategy's groups, returning each
+// package's record in the installed db alongside.
+func (bc *Context) layerGroups(ctx context.Context) ([]*group, map[*apk.Package][]byte, error) {
 	log := clog.FromContext(ctx)
 
 	if strategy := bc.ic.Layering.Strategy; strategy != "origin" {
-		return nil, fmt.Errorf("unrecognized layering strategy %q", strategy)
+		return nil, nil, fmt.Errorf("unrecognized layering strategy %q", strategy)
 	}
 
 	if bc.ic.Contents.BaseImage != nil {
-		return nil, fmt.Errorf("layering with %q is unsupported", "baseimage")
+		return nil, nil, fmt.Errorf("layering with %q is unsupported", "baseimage")
 	}
 
 	// Build a single fs.FS, the normal way (this writes to bc.fs).
 	diffs, err := bc.buildImage(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("building filesystem: %w", err)
+		return nil, nil, fmt.Errorf("building filesystem: %w", err)
 	}
 
 	pkgs := make([]*apk.Package, 0, len(diffs))
@@ -67,13 +83,13 @@ func (bc *Context) buildLayers(ctx context.Context) ([]v1.Layer, error) {
 	//
 	// TODO: Clean this up when time permits.
 	if err := bc.postBuildSetApk(ctx); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	// Use our layering strategy to partition packages into a set of Budget groups.
 	groups, err := groupByOriginAndSize(pkgs, bc.ic.Layering.Budget)
 	if err != nil {
-		return nil, fmt.Errorf("grouping packages: %w", err)
+		return nil, nil, fmt.Errorf("grouping packages: %w", err)
 	}
 	log.Infof("Building %d layers with budget %d", len(groups), bc.ic.Layering.Budget)
 
@@ -85,11 +101,7 @@ func (bc *Context) buildLayers(ctx context.Context) ([]v1.Layer, error) {
 		}
 	}
 
-	// Then partition that single fs.FS into multiple layers based on our layering strategy.
-	if bc.ic.Format.Resolved() == types.LayerFormatErofs {
-		return splitErofsLayers(ctx, bc.fs, groups, pkgToDiff, bc.o.TempDir(), bc.o.SourceDateEpoch)
-	}
-	return splitLayers(ctx, bc.fs, groups, pkgToDiff, bc.o.TempDir(), bc.o.CompressedLayerFile)
+	return groups, pkgToDiff, nil
 }
 
 func replacesGroup(rep string, g *group) (bool, error) {
@@ -510,7 +522,7 @@ func splitLayers(ctx context.Context, fsys apkfs.FullFS, groups []*group, pkgToD
 // stack:   [usr, usr/lib]
 // w.stack: [usr, usr/lib, usr/lib/foo]
 // return:  []
-func (w *layerWriter) alignStacks(stack []*file) []*file {
+func (w *dirStack) alignStacks(stack []*file) []*file {
 	for i := 0; i < max(len(w.stack), len(stack)); i++ {
 		// The layer's stack is taller than the main stack, truncate layer's stack.
 		if i >= len(stack) {

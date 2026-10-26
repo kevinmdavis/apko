@@ -208,7 +208,7 @@ func TestAlignStacks(t *testing.T) {
 	}} {
 		t.Run(fmt.Sprintf("case_%d", i), func(t *testing.T) {
 			// clone to avoid mutating the usr and etc slices directly
-			w := &layerWriter{stack: slices.Clone(tc.before)}
+			w := &dirStack{stack: slices.Clone(tc.before)}
 
 			if err := compareStacks(w.alignStacks(tc.stack), tc.diff); err != nil {
 				t.Errorf("alignStacks() mismatch: %v", err)
