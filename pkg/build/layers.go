@@ -35,20 +35,36 @@ import (
 )
 
 func (bc *Context) buildLayers(ctx context.Context) ([]v1.Layer, error) {
+	groups, pkgToDiff, err := bc.layerGroups(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	// Then partition that single fs.FS into multiple layers based on our layering strategy.
+	if bc.ic.Format.Resolved() == types.LayerFormatErofs {
+		return splitErofsLayers(ctx, bc.fs, groups, pkgToDiff, bc.o.TempDir(), bc.o.SourceDateEpoch)
+	}
+	return splitLayers(ctx, bc.fs, groups, pkgToDiff, bc.o.TempDir(), bc.o.CompressedLayerFile)
+}
+
+// layerGroups builds the image filesystem for a multi-layer build and
+// partitions its packages into the layering strategy's groups, returning each
+// package's record in the installed db alongside.
+func (bc *Context) layerGroups(ctx context.Context) ([]*group, map[*apk.Package][]byte, error) {
 	log := clog.FromContext(ctx)
 
 	if strategy := bc.ic.Layering.Strategy; strategy != "origin" {
-		return nil, fmt.Errorf("unrecognized layering strategy %q", strategy)
+		return nil, nil, fmt.Errorf("unrecognized layering strategy %q", strategy)
 	}
 
 	if bc.ic.Contents.BaseImage != nil {
-		return nil, fmt.Errorf("layering with %q is unsupported", "baseimage")
+		return nil, nil, fmt.Errorf("layering with %q is unsupported", "baseimage")
 	}
 
 	// Build a single fs.FS, the normal way (this writes to bc.fs).
 	diffs, err := bc.buildImage(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("building filesystem: %w", err)
+		return nil, nil, fmt.Errorf("building filesystem: %w", err)
 	}
 
 	pkgs := make([]*apk.Package, 0, len(diffs))
@@ -67,13 +83,13 @@ func (bc *Context) buildLayers(ctx context.Context) ([]v1.Layer, error) {
 	//
 	// TODO: Clean this up when time permits.
 	if err := bc.postBuildSetApk(ctx); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	// Use our layering strategy to partition packages into a set of Budget groups.
 	groups, err := groupByOriginAndSize(pkgs, bc.ic.Layering.Budget)
 	if err != nil {
-		return nil, fmt.Errorf("grouping packages: %w", err)
+		return nil, nil, fmt.Errorf("grouping packages: %w", err)
 	}
 	log.Infof("Building %d layers with budget %d", len(groups), bc.ic.Layering.Budget)
 
@@ -85,11 +101,7 @@ func (bc *Context) buildLayers(ctx context.Context) ([]v1.Layer, error) {
 		}
 	}
 
-	// Then partition that single fs.FS into multiple layers based on our layering strategy.
-	if bc.ic.Format.Resolved() == types.LayerFormatErofs {
-		return splitErofsLayers(ctx, bc.fs, groups, pkgToDiff, bc.o.TempDir(), bc.o.SourceDateEpoch)
-	}
-	return splitLayers(ctx, bc.fs, groups, pkgToDiff, bc.o.TempDir(), bc.o.CompressedLayerFile)
+	return groups, pkgToDiff, nil
 }
 
 func replacesGroup(rep string, g *group) (bool, error) {
@@ -302,27 +314,65 @@ func splitLayers(ctx context.Context, fsys apkfs.FullFS, groups []*group, pkgToD
 		return w, nil
 	}
 
-	// We'll create a writer for each layer and a map to quickly access the writer given a package or group.
-	packageToWriter := map[string]*layerWriter{}
-	groupToWriter := map[*group]*layerWriter{}
-
-	for _, g := range groups {
+	// A writer for each layer: one per group, then the top layer.
+	writers := make([]*layerWriter, 0, len(groups)+1)
+	sinks := make([]layerSink, 0, len(groups)+1)
+	for range len(groups) + 1 {
 		w, err := newOpenWriter()
 		if err != nil {
 			return nil, err
 		}
-		groupToWriter[g] = w
+		writers = append(writers, w)
+		sinks = append(sinks, tarSink{tw: w.w, fsys: fsys, buf: buf})
+	}
+	if err := partitionLayers(ctx, fsys, groups, pkgToDiff, sinks); err != nil {
+		return nil, err
+	}
 
-		for _, pkg := range g.pkgs {
-			packageToWriter[pkg.Name] = w
+	// Once we're done walking the FS, we need to finalize each layer...
+	layers := make([]v1.Layer, 0, len(writers))
+	for i, w := range writers {
+		l, err := w.finalize()
+		if err != nil {
+			if i == len(groups) {
+				return nil, fmt.Errorf("finalizing top layer: %w", err)
+			}
+			return nil, fmt.Errorf("finalizing group[%d] layer: %w", i, err)
+		}
+		layers = append(layers, l)
+	}
+
+	for _, o := range open {
+		if err := o.f.Close(); err != nil {
+			return nil, fmt.Errorf("closing %s: %w", o.f.Name(), err)
 		}
 	}
 
-	// The top layer holds anything that doesn't belong to a package.
-	top, err := newOpenWriter()
-	if err != nil {
-		return nil, err
+	finished = true
+	return layers, nil
+}
+
+// layerSink takes one layer's tar entries, in order.
+type layerSink interface {
+	// add takes an entry of the build filesystem, whose content, for a
+	// regular file, is the file at f.path.
+	add(f *file) error
+	// addData takes an entry whose content is data.
+	addData(hdr *tar.Header, data []byte) error
+}
+
+// partitionLayers walks fsys once and hands each entry to its layer's sink:
+// sinks[i] for groups[i], and the last for the top layer, which holds
+// anything that doesn't belong to a package. Each entry is handed over with
+// its header as it is at that moment.
+func partitionLayers(ctx context.Context, fsys apkfs.FullFS, groups []*group, pkgToDiff map[*apk.Package][]byte, sinks []layerSink) error {
+	packageToLayer := map[string]int{}
+	for i, g := range groups {
+		for _, pkg := range g.pkgs {
+			packageToLayer[pkg.Name] = i
+		}
 	}
+	stacks := make([]dirStack, len(sinks))
 
 	// In a tar file, it is customary to include directories before files in those directories.
 	// In order to know which directories we need to include, we maintain a directory stack for each layer.
@@ -333,7 +383,7 @@ func splitLayers(ctx context.Context, fsys apkfs.FullFS, groups []*group, pkgToD
 
 	for f, err := range walkFS(ctx, fsys) {
 		if err != nil {
-			return nil, err
+			return err
 		}
 
 		// Maintain our "main" stack.
@@ -352,7 +402,7 @@ func splitLayers(ctx context.Context, fsys apkfs.FullFS, groups []*group, pkgToD
 		}
 
 		// By default, all files go into the top layer.
-		w := top
+		i := len(sinks) - 1
 
 		// However, if a file implements an extension interface that tells us what package owns it,
 		// we can use that to determine which layer it belongs to (if any).
@@ -360,15 +410,15 @@ func splitLayers(ctx context.Context, fsys apkfs.FullFS, groups []*group, pkgToD
 			Package() *apk.Package
 		}); ok {
 			if pkg := pkger.Package(); pkg != nil {
-				w, ok = packageToWriter[pkg.Name]
+				i, ok = packageToLayer[pkg.Name]
 				if !ok {
-					panic(fmt.Errorf("packageToWriter[%q] missing", pkg.Name))
+					return fmt.Errorf("no layer for package %q, which owns %s", pkg.Name, f.path)
 				}
 			}
 		}
 
 		// As described above, bring the layer's stack up to date with the main stack.
-		for _, todo := range w.alignStacks(stack) {
+		for _, todo := range stacks[i].alignStacks(stack) {
 			// We need to write any missing directories returned by alignStacks.
 			// But sometimes the result of alignStacks will include the file we're
 			// about to write (f) after this loop. In those cases, make sure we
@@ -392,96 +442,88 @@ func splitLayers(ctx context.Context, fsys apkfs.FullFS, groups []*group, pkgToD
 			// timestamp with the timestamp of the "f" file we're about to write to this layer.
 			todo.header.ModTime = f.header.ModTime
 
-			if err := w.w.WriteHeader(todo.header); err != nil {
-				return nil, fmt.Errorf("writing header %s: %w", todo.header.Name, err)
+			if err := sinks[i].add(todo); err != nil {
+				return err
 			}
 		}
 
 		// Now we're back to normal tar stuff.
-		if err := w.w.WriteHeader(f.header); err != nil {
-			return nil, fmt.Errorf("writing header %s: %w", f.header.Name, err)
+		if err := sinks[i].add(f); err != nil {
+			return err
 		}
 
-		if f.header.Typeflag == tar.TypeReg && f.header.Size > 0 {
-			data, err := fsys.Open(f.path)
-			if err != nil {
-				return nil, fmt.Errorf("opening %s: %w", f.path, err)
-			}
-			if _, err := io.CopyBuffer(w.w, data, buf); err != nil {
-				return nil, fmt.Errorf("copying %s: %w", f.path, err)
-			}
-
-			// Should never fail in practice.
-			if err := data.Close(); err != nil {
-				return nil, fmt.Errorf("closing %s: %w", f.path, err)
-			}
-		}
-
-		if f.header.Name == "usr/lib/apk/db/installed" {
+		if f.header.Name == installedDB {
 			// Add a partial installed db to each layer to satisfy scanners.
-			for _, g := range groups {
-				w := groupToWriter[g]
-
+			for gi, g := range groups {
 				// Make sure we have all parent directories to appease AWS Lambda.
-				for _, todo := range w.alignStacks(stack) {
+				for _, todo := range stacks[gi].alignStacks(stack) {
 					todo.header.ModTime = f.header.ModTime
 
-					if err := w.w.WriteHeader(todo.header); err != nil {
-						return nil, fmt.Errorf("writing header %s: %w", todo.header.Name, err)
+					if err := sinks[gi].add(todo); err != nil {
+						return err
 					}
 				}
 
 				// Accumulate all the idb entries for this layer.
 				var buf bytes.Buffer
 				for _, pkg := range g.pkgs {
-					if _, err := buf.Write(pkgToDiff[pkg]); err != nil {
-						return nil, err
-					}
+					buf.Write(pkgToDiff[pkg])
 				}
 
 				// Only the size should be different across layers.
 				idb := *f.header
 				idb.Size = int64(buf.Len())
 
-				if err := w.w.WriteHeader(&idb); err != nil {
-					return nil, err
-				}
-
-				if _, err := io.Copy(w.w, &buf); err != nil {
-					return nil, err
+				if err := sinks[gi].addData(&idb, buf.Bytes()); err != nil {
+					return err
 				}
 			}
 		}
 	}
+	return nil
+}
 
-	// Once we're done walking the FS, we need to finalize each layer...
-	layers := make([]v1.Layer, 0, len(groups)+1)
-	for i, g := range groups {
-		w := groupToWriter[g]
+// tarSink writes a layer's entries to its tar as they come, reading file
+// content from fsys.
+type tarSink struct {
+	tw   *tar.Writer
+	fsys apkfs.FullFS
+	buf  []byte
+}
 
-		l, err := w.finalize()
-		if err != nil {
-			return nil, fmt.Errorf("finalizing group[%d] layer: %w", i, err)
-		}
-		layers = append(layers, l)
+func (s tarSink) add(f *file) error {
+	if err := s.tw.WriteHeader(f.header); err != nil {
+		return fmt.Errorf("writing header %s: %w", f.header.Name, err)
 	}
-
-	// ...including the top layer.
-	topLayer, err := top.finalize()
+	if !hasContent(f.header) {
+		return nil
+	}
+	data, err := s.fsys.Open(f.path)
 	if err != nil {
-		return nil, fmt.Errorf("finalizing top layer: %w", err)
+		return fmt.Errorf("opening %s: %w", f.path, err)
 	}
-
-	layers = append(layers, topLayer)
-
-	for _, o := range open {
-		if err := o.f.Close(); err != nil {
-			return nil, fmt.Errorf("closing %s: %w", o.f.Name(), err)
-		}
+	if _, err := io.CopyBuffer(s.tw, data, s.buf); err != nil {
+		return fmt.Errorf("copying %s: %w", f.path, err)
 	}
+	// Should never fail in practice.
+	if err := data.Close(); err != nil {
+		return fmt.Errorf("closing %s: %w", f.path, err)
+	}
+	return nil
+}
 
-	finished = true
-	return layers, nil
+func (s tarSink) addData(hdr *tar.Header, data []byte) error {
+	if err := s.tw.WriteHeader(hdr); err != nil {
+		return fmt.Errorf("writing header %s: %w", hdr.Name, err)
+	}
+	_, err := s.tw.Write(data)
+	return err
+}
+
+// dirStack is the stack of directories a layer has written so far, along the
+// path of the walk.
+type dirStack struct {
+	stack []*file
 }
 
 // alignStacks ensures that w.stack is aligned with the passed in "main" stack
@@ -510,7 +552,7 @@ func splitLayers(ctx context.Context, fsys apkfs.FullFS, groups []*group, pkgToD
 // stack:   [usr, usr/lib]
 // w.stack: [usr, usr/lib, usr/lib/foo]
 // return:  []
-func (w *layerWriter) alignStacks(stack []*file) []*file {
+func (w *dirStack) alignStacks(stack []*file) []*file {
 	for i := 0; i < max(len(w.stack), len(stack)); i++ {
 		// The layer's stack is taller than the main stack, truncate layer's stack.
 		if i >= len(stack) {
