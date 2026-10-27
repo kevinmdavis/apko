@@ -27,6 +27,7 @@ import (
 	"golang.org/x/sys/unix"
 
 	apkfs "chainguard.dev/apko/pkg/apk/fs"
+	"chainguard.dev/apko/pkg/elfmeta"
 	"chainguard.dev/apko/pkg/passwd"
 )
 
@@ -165,6 +166,11 @@ func walkFS(ctx context.Context, fsys apkfs.FullFS) iter.Seq2[*file, error] {
 				// we can ignore errors
 				if err == nil && xattrs != nil {
 					for name, value := range xattrs {
+						// An elfmeta stamp is build-time metadata, read for
+						// the ld.so cache, and no package's file carries one.
+						if name == elfmeta.Xattr {
+							continue
+						}
 						header.PAXRecords[xattrTarPAXRecordsPrefix+name] = string(value)
 					}
 				}
