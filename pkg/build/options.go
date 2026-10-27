@@ -268,6 +268,17 @@ func WithoutDiskCache() Option {
 	}
 }
 
+// WithoutElfmetaStamps keeps elfmeta stamps out of tar and EROFS image layers.
+// Stamps remain available for ld.so.cache generation during the build.
+// This also omits stamps carried by packages, so use it only when the
+// packages are known not to carry them.
+func WithoutElfmetaStamps() Option {
+	return func(bc *Context) error {
+		bc.o.OmitElfmetaStamps = true
+		return nil
+	}
+}
+
 func WithLockFile(lockFile string) Option {
 	return func(bc *Context) error {
 		bc.o.Lockfile = lockFile

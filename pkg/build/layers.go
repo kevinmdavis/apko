@@ -42,9 +42,9 @@ func (bc *Context) buildLayers(ctx context.Context) ([]v1.Layer, error) {
 
 	// Then partition that single fs.FS into multiple layers based on our layering strategy.
 	if bc.ic.Format.Resolved() == types.LayerFormatErofs {
-		return splitErofsLayers(ctx, bc.fs, groups, pkgToDiff, bc.o.TempDir(), bc.o.SourceDateEpoch)
+		return splitErofsLayers(ctx, bc.layerFS(), groups, pkgToDiff, bc.o.TempDir(), bc.o.SourceDateEpoch)
 	}
-	return splitLayers(ctx, bc.fs, groups, pkgToDiff, bc.o.TempDir(), bc.o.CompressedLayerFile)
+	return splitLayers(ctx, bc.layerFS(), groups, pkgToDiff, bc.o.TempDir(), bc.o.CompressedLayerFile)
 }
 
 // layerGroups builds the image filesystem in bc.fs and groups packages

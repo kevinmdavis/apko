@@ -91,6 +91,7 @@ type Options struct {
 	Transport           http.RoundTripper     `json:"-"`
 	PackageGetter       apk.PackageGetter     `json:"-"`
 	SizeLimits          SizeLimits            `json:"sizeLimits,omitempty"`
+	OmitElfmetaStamps   bool                  `json:"omitElfmetaStamps,omitempty"`
 }
 
 type Auth struct{ User, Pass string }
