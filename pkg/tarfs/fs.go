@@ -209,7 +209,7 @@ func (m *memFS) getNodeCountLinks(path string, linkDepth int) (*node, error) {
 	node := m.tree
 	traversed := make([]string, 0)
 	for _, part := range parts {
-		if part == "" {
+		if part == "" || part == "." {
 			continue
 		}
 		if node.children == nil {
@@ -312,7 +312,7 @@ func (m *memFS) MkdirAll(path string, perm fs.FileMode) error {
 	traversed := make([]string, 0)
 	anode := m.tree
 	for _, part := range parts {
-		if part == "" {
+		if part == "" || part == "." {
 			continue
 		}
 		if anode.children == nil {
