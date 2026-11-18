@@ -51,6 +51,17 @@ const (
 
 var _ apk.WriteHeaderer = (*memFS)(nil)
 
+// apk and build find these methods by assertion, so a changed signature would
+// silently go unused.
+var (
+	_ interface {
+		WriteHeaderAt(tar.Header, fs.FS, *apk.Package, int) (bool, error)
+	} = (*memFS)(nil)
+	_ interface {
+		APKSource() (*apk.Package, string, int)
+	} = (*memFileInfo)(nil)
+)
+
 type tarEntry struct {
 	tfs      fs.FS
 	header   tar.Header

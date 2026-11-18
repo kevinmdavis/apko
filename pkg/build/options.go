@@ -88,13 +88,13 @@ func WithCompressedLayerFile(enabled bool) Option {
 	}
 }
 
-// WithAPKLayerOrder writes each tar layer of a layered build from BuildLayers
-// and PlanLayers so that each package's file contents are contiguous and in
-// the order of the package's apk.PackageContents.Entries. When those entries
-// are in archive order, a reader can read the contents in one forward pass
-// over the package. Layer membership, headers and contents are unchanged, but
-// the entry order and so the layer digests differ from a build without it.
-// Other layer formats ignore it.
+// WithAPKLayerOrder orders the entries of each tar layer of a layered build,
+// from BuildLayers and PlanLayers, so that each package's file contents are
+// contiguous and in the order of the package's apk.PackageContents.Entries.
+// When those entries are in archive order, a package's files can be read in
+// one forward pass over it while rendering. The option sets only the order of
+// entries within each layer, which the layer's digest depends on. Other layer
+// formats ignore it.
 func WithAPKLayerOrder(enabled bool) Option {
 	return func(bc *Context) error {
 		bc.o.APKLayerOrder = enabled
