@@ -483,3 +483,18 @@ func TestTarFSWriteHeaderKeepsSymlinkToDirectory(t *testing.T) {
 	require.NoError(t, err)
 	require.Empty(t, xattrs, "the header's xattrs are not applied to the target directory")
 }
+
+func TestTarFSWriteHeaderDotDirectories(t *testing.T) {
+	tfs := tarfs.New()
+	for _, name := range []string{"./", "./usr/", "./usr/bin/"} {
+		_, err := tfs.WriteHeader(tar.Header{Name: name, Typeflag: tar.TypeDir, Mode: 0o755}, nil, nil)
+		require.NoError(t, err)
+	}
+
+	var paths []string
+	require.NoError(t, fs.WalkDir(tfs, ".", func(p string, _ fs.DirEntry, err error) error {
+		paths = append(paths, p)
+		return err
+	}))
+	require.Equal(t, []string{".", "usr", "usr/bin"}, paths)
+}
